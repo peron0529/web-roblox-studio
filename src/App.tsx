@@ -3,6 +3,7 @@ import * as THREE from "three"
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js"
 import { TransformControls } from "three/examples/jsm/controls/TransformControls.js"
 
+// ====================== Types ======================
 type Vec3 = { x: number; y: number; z: number }
 type Color = { r: number; g: number; b: number }
 type Part = {
@@ -22,35 +23,162 @@ const num = (v: string) => {
 }
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
 
-// -------------------- MiniLua (safe, block-based) --------------------
-type Expr = { kind: "num"; value: number } | { kind: "str"; value: string } | { kind: "var"; name: string }
-type Cond = { left: Expr; op: "==" | "~=" | ">" | "<" | ">=" | "<="; right: Expr }
+// ====================== MiniLua (safe) ======================
+// - Supported:
+//   print("text")
+//   move(x,y,z) / setPosition(x,y,z) / setSize(x,y,z) / setColor(r,g,b) / wait(sec)
+//   if cond then ... else ... end
+//   for i=1,10 do ... end
+//   repeat ... until cond
+//   while cond do ... end
+//   variable assignment: a = 3, a = a + 1
+// - Expressions: numbers, strings, variables, + - * / with parentheses (basic)
+
+type BinOp = "+" | "-" | "*" | "/"
+type Expr =
+  | { kind: "num"; value: number }
+  | { kind: "str"; value: string }
+  | { kind: "var"; name: string }
+  | { kind: "bin"; op: BinOp; left: Expr; right: Expr }
+
+type CmpOp = "==" | "~=" | ">" | "<" | ">=" | "<="
+type Cond = { left: Expr; op: CmpOp; right: Expr }
+
 type Stmt =
   | { kind: "call"; fn: string; args: Expr[]; line: number }
+  | { kind: "assign"; name: string; expr: Expr; line: number }
   | { kind: "if"; cond: Cond; thenBlock: Stmt[]; elseBlock: Stmt[]; line: number }
   | { kind: "for"; varName: string; start: Expr; end: Expr; step: Expr; block: Stmt[]; line: number }
   | { kind: "repeat"; block: Stmt[]; untilCond: Cond; line: number }
+  | { kind: "while"; cond: Cond; block: Stmt[]; line: number }
 
 function stripComment(line: string) {
-  // 超簡易：-- 以降はコメント
   const i = line.indexOf("--")
   return (i >= 0 ? line.slice(0, i) : line).trim()
 }
 
-function parseExpr(raw: string): Expr {
-  const s = raw.trim()
-  if (!s) return { kind: "num", value: 0 }
-  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
-    const body = s.slice(1, -1)
-    return { kind: "str", value: body }
+// --- expression parser (tiny) ---
+function tokenizeExpr(s: string): string[] {
+  // tokens: numbers, identifiers, strings, operators, parentheses
+  const out: string[] = []
+  let i = 0
+  while (i < s.length) {
+    const ch = s[i]
+    if (ch === " " || ch === "\t" || ch === "\r") {
+      i++
+      continue
+    }
+    if (ch === "(" || ch === ")" || ch === "+" || ch === "-" || ch === "*" || ch === "/") {
+      out.push(ch)
+      i++
+      continue
+    }
+    if (ch === '"' || ch === "'") {
+      const q = ch
+      i++
+      let buf = ""
+      while (i < s.length && s[i] !== q) {
+        if (s[i] === "\\" && i + 1 < s.length) {
+          const n = s[i + 1]
+          if (n === "n") buf += "\n"
+          else buf += n
+          i += 2
+          continue
+        }
+        buf += s[i]
+        i++
+      }
+      if (i < s.length && s[i] === q) i++
+      out.push(q + buf + q) // keep quotes marker
+      continue
+    }
+    // number or identifier
+    let buf = ""
+    while (i < s.length) {
+      const c = s[i]
+      if (" \t\r()+-*/".includes(c)) break
+      buf += c
+      i++
+    }
+    if (buf) out.push(buf)
   }
-  const n = Number(s)
-  if (Number.isFinite(n)) return { kind: "num", value: n }
-  return { kind: "var", name: s }
+  return out
+}
+
+function parseExpr(raw: string): Expr {
+  const tokens = tokenizeExpr(raw.trim())
+  let pos = 0
+
+  const peek = () => tokens[pos]
+  const next = () => tokens[pos++]
+
+  const parsePrimary = (): Expr => {
+    const t = peek()
+    if (!t) return { kind: "num", value: 0 }
+
+    if (t === "(") {
+      next()
+      const e = parseAddSub()
+      if (peek() === ")") next()
+      return e
+    }
+
+    // string token: "xxx" or 'xxx' kept as quoted marker
+    if ((t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'"))) {
+      next()
+      return { kind: "str", value: t.slice(1, -1) }
+    }
+
+    const n = Number(t)
+    if (Number.isFinite(n)) {
+      next()
+      return { kind: "num", value: n }
+    }
+
+    // identifier
+    next()
+    return { kind: "var", name: t }
+  }
+
+  const parseMulDiv = (): Expr => {
+    let left = parsePrimary()
+    while (peek() === "*" || peek() === "/") {
+      const op = next() as BinOp
+      const right = parsePrimary()
+      left = { kind: "bin", op, left, right }
+    }
+    return left
+  }
+
+  const parseAddSub = (): Expr => {
+    let left = parseMulDiv()
+    while (peek() === "+" || peek() === "-") {
+      const op = next() as BinOp
+      const right = parseMulDiv()
+      left = { kind: "bin", op, left, right }
+    }
+    return left
+  }
+
+  return parseAddSub()
+}
+
+function parseCond(text: string): Cond {
+  const s = text.trim()
+  const ops: CmpOp[] = ["==", "~=", ">=", "<=", ">", "<"]
+  for (const op of ops) {
+    const idx = s.indexOf(op)
+    if (idx >= 0) {
+      const L = s.slice(0, idx).trim()
+      const R = s.slice(idx + op.length).trim()
+      return { left: parseExpr(L), op, right: parseExpr(R) }
+    }
+  }
+  // fallback: expr ~= 0
+  return { left: parseExpr(s), op: "~=", right: { kind: "num", value: 0 } }
 }
 
 function splitArgs(argText: string): string[] {
-  // カンマ区切り。文字列の中のカンマは無視（簡易）
   const s = argText.trim()
   if (!s) return []
   const out: string[] = []
@@ -79,33 +207,16 @@ function splitArgs(argText: string): string[] {
   return out
 }
 
-function parseCond(text: string): Cond {
-  // 例: i <= 10  / 1 == 1 / x ~= 0
-  const s = text.trim()
-  const ops = ["==", "~=", ">=", "<=", ">", "<"] as const
-  for (const op of ops) {
-    const idx = s.indexOf(op)
-    if (idx >= 0) {
-      const left = s.slice(0, idx).trim()
-      const right = s.slice(idx + op.length).trim()
-      return { left: parseExpr(left), op, right: parseExpr(right) }
-    }
-  }
-  // fallback: treat as "expr ~= 0"
-  return { left: parseExpr(s), op: "~=", right: { kind: "num", value: 0 } }
-}
-
 function parseScript(code: string): { ast: Stmt[]; errors: string[] } {
   const errors: string[] = []
   const lines = code.split("\n").map(stripComment)
 
-  // ブロック構文: if/else/end, for/end, repeat/until
-  // スタックでAST作る
   type Frame =
     | { type: "root"; block: Stmt[] }
     | { type: "if"; stmt: Extract<Stmt, { kind: "if" }>; inElse: boolean }
     | { type: "for"; stmt: Extract<Stmt, { kind: "for" }> }
     | { type: "repeat"; stmt: Extract<Stmt, { kind: "repeat" }> }
+    | { type: "while"; stmt: Extract<Stmt, { kind: "while" }> }
 
   const root: Frame = { type: "root", block: [] }
   const stack: Frame[] = [root]
@@ -115,6 +226,7 @@ function parseScript(code: string): { ast: Stmt[]; errors: string[] } {
     if (top.type === "root") return top.block
     if (top.type === "if") return top.inElse ? top.stmt.elseBlock : top.stmt.thenBlock
     if (top.type === "for") return top.stmt.block
+    if (top.type === "while") return top.stmt.block
     return top.stmt.block // repeat
   }
 
@@ -126,33 +238,27 @@ function parseScript(code: string): { ast: Stmt[]; errors: string[] } {
     // else
     if (raw === "else") {
       const top = stack[stack.length - 1]
-      if (top.type !== "if") {
-        errors.push(`line ${lineNo}: else の位置が変`)
-      } else {
-        top.inElse = true
-      }
+      if (top.type !== "if") errors.push(`line ${lineNo}: else の位置が変`)
+      else top.inElse = true
       continue
     }
 
-    // end
+    // end (closes if/for/while)
     if (raw === "end") {
       const top = stack[stack.length - 1]
-      if (top.type === "if" || top.type === "for") {
-        stack.pop()
-      } else {
-        errors.push(`line ${lineNo}: end の対応が無い`)
-      }
+      if (top.type === "if" || top.type === "for" || top.type === "while") stack.pop()
+      else errors.push(`line ${lineNo}: end の対応が無い`)
       continue
     }
 
-    // until (repeat)
+    // until (closes repeat)
     if (raw.startsWith("until ")) {
       const top = stack[stack.length - 1]
       if (top.type !== "repeat") {
         errors.push(`line ${lineNo}: until の対応が無い`)
       } else {
         top.stmt.untilCond = parseCond(raw.slice("until ".length))
-        stack.pop() // close repeat
+        stack.pop()
       }
       continue
     }
@@ -172,10 +278,9 @@ function parseScript(code: string): { ast: Stmt[]; errors: string[] } {
       continue
     }
 
-    // for i=1,10 do  / for i=1,10,2 do
+    // for i=1,10 do / for i=1,10,step do
     if (raw.startsWith("for ") && raw.endsWith(" do")) {
       const inside = raw.slice(4, -3).trim()
-      // i=1,10,2
       const m = inside.match(/^([a-zA-Z_]\w*)\s*=\s*(.+)$/)
       if (!m) {
         errors.push(`line ${lineNo}: for の書き方が違う`)
@@ -183,17 +288,17 @@ function parseScript(code: string): { ast: Stmt[]; errors: string[] } {
       }
       const varName = m[1]
       const rest = m[2]
-      const parts = splitArgs(rest)
-      if (parts.length < 2 || parts.length > 3) {
+      const args = splitArgs(rest)
+      if (args.length < 2 || args.length > 3) {
         errors.push(`line ${lineNo}: for は for i=1,10 do か for i=1,10,step do`)
         continue
       }
       const stmt: Extract<Stmt, { kind: "for" }> = {
         kind: "for",
         varName,
-        start: parseExpr(parts[0]),
-        end: parseExpr(parts[1]),
-        step: parseExpr(parts[2] ?? "1"),
+        start: parseExpr(args[0]),
+        end: parseExpr(args[1]),
+        step: parseExpr(args[2] ?? "1"),
         block: [],
         line: lineNo,
       }
@@ -215,6 +320,29 @@ function parseScript(code: string): { ast: Stmt[]; errors: string[] } {
       continue
     }
 
+    // while ... do
+    if (raw.startsWith("while ") && raw.endsWith(" do")) {
+      const condText = raw.slice("while ".length, -3).trim()
+      const stmt: Extract<Stmt, { kind: "while" }> = {
+        kind: "while",
+        cond: parseCond(condText),
+        block: [],
+        line: lineNo,
+      }
+      currentBlock().push(stmt)
+      stack.push({ type: "while", stmt })
+      continue
+    }
+
+    // assignment: name = expr
+    const asn = raw.match(/^([a-zA-Z_]\w*)\s*=\s*(.+)$/)
+    if (asn) {
+      const name = asn[1]
+      const exprText = asn[2]
+      currentBlock().push({ kind: "assign", name, expr: parseExpr(exprText), line: lineNo })
+      continue
+    }
+
     // call: fn(args)
     const call = raw.match(/^([a-zA-Z_]\w*)\s*\((.*)\)\s*$/)
     if (!call) {
@@ -227,11 +355,12 @@ function parseScript(code: string): { ast: Stmt[]; errors: string[] } {
     currentBlock().push({ kind: "call", fn, args, line: lineNo })
   }
 
-  // close check
+  // unclosed blocks
   for (let i = stack.length - 1; i >= 1; i--) {
     const top = stack[i]
     if (top.type === "if") errors.push(`line ${top.stmt.line}: if が end で閉じられてない`)
     if (top.type === "for") errors.push(`line ${top.stmt.line}: for が end で閉じられてない`)
+    if (top.type === "while") errors.push(`line ${top.stmt.line}: while が end で閉じられてない`)
     if (top.type === "repeat") errors.push(`line ${top.stmt.line}: repeat が until で閉じられてない`)
   }
 
@@ -241,7 +370,16 @@ function parseScript(code: string): { ast: Stmt[]; errors: string[] } {
 function evalExpr(expr: Expr, env: Record<string, any>) {
   if (expr.kind === "num") return expr.value
   if (expr.kind === "str") return expr.value
-  return env[expr.name]
+  if (expr.kind === "var") return env[expr.name]
+  const a = Number(evalExpr(expr.left, env))
+  const b = Number(evalExpr(expr.right, env))
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return NaN
+  switch (expr.op) {
+    case "+": return a + b
+    case "-": return a - b
+    case "*": return a * b
+    case "/": return b === 0 ? NaN : a / b
+  }
 }
 
 function evalCond(cond: Cond, env: Record<string, any>): boolean {
@@ -271,9 +409,15 @@ async function execBlock(block: Stmt[], env: Record<string, any>, api: RuntimeAP
   for (const st of block) {
     if (api.isCancelled()) return
 
+    if (st.kind === "assign") {
+      env[st.name] = evalExpr(st.expr, env)
+      continue
+    }
+
     if (st.kind === "call") {
       const fn = st.fn
       const args = st.args.map((e) => evalExpr(e, env))
+
       const asNum3 = () => {
         if (args.length !== 3) throw new Error("引数は3つ")
         const ns = args.map((x) => Number(x))
@@ -318,35 +462,58 @@ async function execBlock(block: Stmt[], env: Record<string, any>, api: RuntimeAP
         api.log(`line ${st.line}: for の数字が変`)
         continue
       }
+
+      let guard = 0
       if (step > 0) {
         for (let i = start; i <= end; i += step) {
           if (api.isCancelled()) return
           env[st.varName] = i
           await execBlock(st.block, env, api)
+          guard++
+          if (guard > 20000) { api.log(`line ${st.line}: for が長すぎるので停止`); break }
         }
       } else {
         for (let i = start; i >= end; i += step) {
           if (api.isCancelled()) return
           env[st.varName] = i
           await execBlock(st.block, env, api)
+          guard++
+          if (guard > 20000) { api.log(`line ${st.line}: for が長すぎるので停止`); break }
         }
       }
       continue
     }
 
     if (st.kind === "repeat") {
+      let guard = 0
       while (true) {
         if (api.isCancelled()) return
         await execBlock(st.block, env, api)
         if (evalCond(st.untilCond, env)) break
+        guard++
+        if (guard > 20000) { api.log(`line ${st.line}: repeat が長すぎるので停止`); break }
+      }
+      continue
+    }
+
+    if (st.kind === "while") {
+      let guard = 0
+      while (evalCond(st.cond, env)) {
+        if (api.isCancelled()) return
+        await execBlock(st.block, env, api)
+        guard++
+        if (guard > 20000) { api.log(`line ${st.line}: while が長すぎるので停止`); break }
       }
       continue
     }
   }
 }
 
-// -------------------- App --------------------
+// ====================== App ======================
 export default function App() {
+  const STORAGE_KEY = "wrs_project_v1"
+
+  // data
   const [parts, setParts] = useState<Part[]>(() => [
     {
       id: "p1",
@@ -354,27 +521,50 @@ export default function App() {
       position: { x: 0, y: 1, z: 0 },
       size: { x: 2, y: 2, z: 2 },
       color: { r: 0.9, g: 0.3, b: 0.3 },
-      script: `print("start")\nfor i=1,5 do\n  move(0,0,1)\n  wait(0.2)\nend\nprint("done")`,
-    },
-    {
-      id: "p2",
-      name: "Part2",
-      position: { x: 4, y: 1, z: 0 },
-      size: { x: 2, y: 2, z: 2 },
-      color: { r: 0.2, g: 0.9, b: 0.4 },
-      script: `repeat\n  move(-0.5,0,0)\n  wait(0.15)\nuntil 1 == 1`,
+      script:
+`print("start")
+i = 0
+while i < 20 do
+  move(0,0,0.2)
+  wait(0.05)
+  i = i + 1
+end
+print("done")`,
     },
   ])
-  const [selectedId, setSelectedId] = useState<string>("p1")
+  const [selectedId, setSelectedId] = useState("p1")
   const selected = useMemo(() => parts.find((p) => p.id === selectedId) ?? null, [parts, selectedId])
 
+  // logs
   const [logs, setLogs] = useState<string[]>([])
-  const log = (msg: string) => setLogs((prev) => [...prev, msg].slice(-400))
+  const log = (msg: string) => setLogs((prev) => [...prev, msg].slice(-600))
   const clearLogs = () => setLogs([])
 
-  // Runtime control
+  // runtime control
   const [isPlaying, setIsPlaying] = useState(false)
-  const cancelTokenRef = useRef({ v: 0 })
+  const cancelTokenRef = useRef(0)
+
+  // keep latest parts for runtime reads
+  const partsRef = useRef(parts)
+  useEffect(() => { partsRef.current = parts }, [parts])
+
+  // load once
+  useEffect(() => {
+    const raw = localStorage.getItem(STORAGE_KEY)
+    if (!raw) return
+    try {
+      const loaded = JSON.parse(raw)
+      if (Array.isArray(loaded)) setParts(loaded)
+    } catch {}
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // autosave
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(parts))
+    } catch {}
+  }, [parts])
 
   const addPart = () => {
     const id = uid()
@@ -399,6 +589,12 @@ export default function App() {
     setParts((prev) => prev.map((p) => (p.id === id ? { ...p, ...patch } : p)))
   }
 
+  const stop = () => {
+    cancelTokenRef.current++
+    setIsPlaying(false)
+    log("--- Stopped ---")
+  }
+
   const runScriptForPart = async (partId: string, script: string) => {
     const { ast, errors } = parseScript(script)
     if (errors.length) {
@@ -406,24 +602,29 @@ export default function App() {
       return
     }
 
-    const tokenAtStart = cancelTokenRef.current.v
-    const isCancelled = () => cancelTokenRef.current.v !== tokenAtStart
+    const tokenAtStart = cancelTokenRef.current
+    const isCancelled = () => cancelTokenRef.current !== tokenAtStart
 
     const getPart = () => partsRef.current.find((p) => p.id === partId)
 
     const api: RuntimeAPI = {
       log: (m) => log(`[${partId}] ${m}`),
+
       move: (dx, dy, dz) => {
         const p = getPart()
         if (!p) return
         patchPart(partId, { position: { x: p.position.x + dx, y: p.position.y + dy, z: p.position.z + dz } })
       },
+
       setPosition: (x, y, z) => patchPart(partId, { position: { x, y, z } }),
+
       setColor: (r, g, b) => patchPart(partId, { color: { r: clamp01(r), g: clamp01(g), b: clamp01(b) } }),
-      setSize: (x, y, z) => patchPart(partId, { size: { x: Math.max(0.1, x), y: Math.max(0.1, y), z: Math.max(0.1, z) } }),
+
+      setSize: (x, y, z) =>
+        patchPart(partId, { size: { x: Math.max(0.1, x), y: Math.max(0.1, y), z: Math.max(0.1, z) } }),
+
       wait: async (sec) => {
         const ms = Math.max(0, sec) * 1000
-        // 途中停止できるように細かく刻む
         const step = 50
         let t = 0
         while (t < ms) {
@@ -433,6 +634,7 @@ export default function App() {
           t += dt
         }
       },
+
       isCancelled,
     }
 
@@ -440,49 +642,32 @@ export default function App() {
     await execBlock(ast, env, api)
   }
 
-  // run selected
   const runSelected = async () => {
     if (!selected) return
     clearLogs()
-    cancelTokenRef.current.v++
-    const tokenStart = cancelTokenRef.current.v
+    cancelTokenRef.current++
+    const tokenStart = cancelTokenRef.current
     await runScriptForPart(selected.id, selected.script)
-    // if cancelled mid, ignore
-    if (cancelTokenRef.current.v !== tokenStart) return
+    if (cancelTokenRef.current !== tokenStart) return
   }
 
-  // Play mode: run all parts sequentially (safe + predictable)
   const playAll = async () => {
     clearLogs()
-    cancelTokenRef.current.v++
+    cancelTokenRef.current++
     setIsPlaying(true)
-    const tokenStart = cancelTokenRef.current.v
+    const tokenStart = cancelTokenRef.current
 
-    // 順番に実行
     for (const p of partsRef.current) {
-      if (cancelTokenRef.current.v !== tokenStart) break
+      if (cancelTokenRef.current !== tokenStart) break
       log(`--- Running: ${p.name} (${p.id}) ---`)
       await runScriptForPart(p.id, p.script)
     }
 
-    if (cancelTokenRef.current.v === tokenStart) {
-      log("--- Play finished ---")
-    } else {
-      log("--- Stopped ---")
-    }
+    if (cancelTokenRef.current === tokenStart) log("--- Play finished ---")
     setIsPlaying(false)
   }
 
-  const stopPlay = () => {
-    cancelTokenRef.current.v++
-    setIsPlaying(false)
-  }
-
-  // keep latest parts for runtime reads
-  const partsRef = useRef(parts)
-  useEffect(() => { partsRef.current = parts }, [parts])
-
-  // --- three.js ---
+  // ====================== three.js scene ======================
   const mountRef = useRef<HTMLDivElement | null>(null)
   const sceneRef = useRef<THREE.Scene | null>(null)
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null)
@@ -490,6 +675,8 @@ export default function App() {
   const transformRef = useRef<TransformControls | null>(null)
   const meshMapRef = useRef<Map<string, THREE.Mesh>>(new Map())
   const draggingTransformRef = useRef(false)
+  const selectedIdRef = useRef(selectedId)
+  useEffect(() => { selectedIdRef.current = selectedId }, [selectedId])
 
   useEffect(() => {
     const mount = mountRef.current
@@ -542,6 +729,7 @@ export default function App() {
       patchPart(sel, { position: { x: mesh.position.x, y: mesh.position.y, z: mesh.position.z } })
     })
 
+    // click select
     const raycaster = new THREE.Raycaster()
     const pointer = new THREE.Vector2()
     const onPointerDown = (e: PointerEvent) => {
@@ -560,6 +748,7 @@ export default function App() {
     }
     renderer.domElement.addEventListener("pointerdown", onPointerDown)
 
+    // keys: G/R/S
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === "g" || e.key === "G") transform.setMode("translate")
       if (e.key === "r" || e.key === "R") transform.setMode("rotate")
@@ -596,10 +785,6 @@ export default function App() {
       mount.removeChild(renderer.domElement)
     }
   }, [])
-
-  // keep selected id for event handlers
-  const selectedIdRef = useRef(selectedId)
-  useEffect(() => { selectedIdRef.current = selectedId }, [selectedId])
 
   // sync meshes
   useEffect(() => {
@@ -648,20 +833,45 @@ export default function App() {
     }
   }, [selectedId])
 
+  // ====================== UI ======================
   return (
     <div style={{ height: "100vh", background: "#0b0f16", color: "#e7eefc" }}>
       <div style={topbar}>
         <b>Web Roblox Studio</b>
         <button onClick={addPart} style={btn}>+ Part</button>
+
         <button onClick={runSelected} style={btn2}>Run (Selected)</button>
+
         {!isPlaying ? (
           <button onClick={playAll} style={btnPlay}>Play</button>
         ) : (
-          <button onClick={stopPlay} style={btnStop}>Stop</button>
+          <button onClick={stop} style={btnStop}>Stop</button>
         )}
-        <button onClick={() => setLogs([])} style={btn2}>Clear</button>
+
+        <button onClick={clearLogs} style={btn2}>Clear</button>
+
+        <button onClick={() => {
+          try { localStorage.setItem(STORAGE_KEY, JSON.stringify(parts)) } catch {}
+          log("--- Saved ---")
+        }} style={btn2}>Save</button>
+
+        <button onClick={() => {
+          const raw = localStorage.getItem(STORAGE_KEY)
+          if (!raw) return
+          try {
+            const loaded = JSON.parse(raw)
+            if (Array.isArray(loaded)) setParts(loaded)
+            log("--- Loaded ---")
+          } catch {}
+        }} style={btn2}>Load</button>
+
+        <button onClick={() => {
+          localStorage.removeItem(STORAGE_KEY)
+          location.reload()
+        }} style={btn2}>Reset</button>
+
         <div style={{ opacity: 0.8, fontSize: 12 }}>
-          操作: 右ドラッグ=視点 / G=移動 / R=回転 / S=拡縮 / Script: if/for/repeat/wait
+          操作: 右ドラッグ=視点 / G=移動 / R=回転 / S=拡縮 / Script: if/for/repeat/while/wait/変数
         </div>
       </div>
 
@@ -725,15 +935,24 @@ export default function App() {
                   placeholder={
 `例:
 print("hi")
-if 1 == 1 then
-  move(0,1,0)
-else
-  move(0,-1,0)
-end
 
+x = 0
 for i=1,10 do
   move(0,0,0.5)
   wait(0.1)
+end
+
+i = 0
+while i < 20 do
+  move(0,1,0)
+  wait(0.05)
+  i = i + 1
+end
+
+if 1 == 1 then
+  setColor(1,0,0)
+else
+  setColor(0,1,0)
 end
 
 repeat
@@ -759,6 +978,7 @@ until 1 == 1
   )
 }
 
+// ====================== Styles ======================
 const topbar: React.CSSProperties = {
   height: 48,
   display: "flex",
