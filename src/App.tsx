@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react"
 import * as THREE from "three"
+import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js"
+import { TransformControls } from "three/examples/jsm/controls/TransformControls.js"
 
 type Vec3 = { x: number; y: number; z: number }
 type Color = { r: number; g: number; b: number }
@@ -9,9 +11,15 @@ type Part = {
   position: Vec3
   size: Vec3
   color: Color
+  script: string
 }
 
 const uid = () => Math.random().toString(36).slice(2, 10)
+const clamp01 = (n: number) => Math.max(0, Math.min(1, n))
+const num = (v: string) => {
+  const n = Number(v)
+  return Number.isFinite(n) ? n : 0
+}
 
 export default function App() {
   // --- data ---
@@ -22,6 +30,7 @@ export default function App() {
       position: { x: 0, y: 1, z: 0 },
       size: { x: 2, y: 2, z: 2 },
       color: { r: 0.9, g: 0.3, b: 0.3 },
+      script: "print('hello from part')",
     },
   ])
   const [selectedId, setSelectedId] = useState<string>("p1")
@@ -39,6 +48,7 @@ export default function App() {
         position: { x: 0, y: 1, z: 0 },
         size: { x: 2, y: 2, z: 2 },
         color: { r: 0.3, g: 0.8, b: 1.0 },
+        script: "",
       })
     )
     setSelectedId(id)
@@ -50,10 +60,13 @@ export default function App() {
 
   // --- three.js refs ---
   const mountRef = useRef<HTMLDivElement | null>(null)
-  const rendererRef = useRef<THREE.WebGLRenderer | null>(null)
   const sceneRef = useRef<THREE.Scene | null>(null)
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null)
+  const rendererRef = useRef<THREE.WebGLRenderer | null>(null)
+  const orbitRef = useRef<OrbitControls | null>(null)
+  const transformRef = useRef<TransformControls | null>(null)
   const meshMapRef = useRef<Map<string, THREE.Mesh>>(new Map())
+  const draggingTransformRef = useRef(false)
 
   // init scene once
   useEffect(() => {
@@ -63,13 +76,8 @@ export default function App() {
     const scene = new THREE.Scene()
     sceneRef.current = scene
 
-    const camera = new THREE.PerspectiveCamera(
-      60,
-      mount.clientWidth / mount.clientHeight,
-      0.1,
-      1000
-    )
-    camera.position.set(8, 8, 12)
+    const camera = new THREE.PerspectiveCamera(60, mount.clientWidth / mount.clientHeight, 0.1, 2000)
+    camera.position.set(10, 10, 14)
     camera.lookAt(0, 0, 0)
     cameraRef.current = camera
 
@@ -86,16 +94,35 @@ export default function App() {
 
     // ground
     const ground = new THREE.Mesh(
-      new THREE.PlaneGeometry(80, 80),
+      new THREE.PlaneGeometry(120, 120),
       new THREE.MeshStandardMaterial({ color: 0x111827 })
     )
     ground.rotation.x = -Math.PI / 2
-    ground.receiveShadow = true
     scene.add(ground)
+
+    // OrbitControls (camera)
+    const orbit = new OrbitControls(camera, renderer.domElement)
+    orbit.enableDamping = true
+    orbit.dampingFactor = 0.08
+    orbitRef.current = orbit
+
+    // TransformControls (gizmo)
+    const transform = new TransformControls(camera, renderer.domElement)
+    transform.setMode("translate")
+    transform.enabled = true
+    scene.add(transform)
+    transformRef.current = transform
+
+    // while dragging gizmo, disable orbit
+    transform.addEventListener("dragging-changed", (e: any) => {
+      draggingTransformRef.current = !!e.value
+      if (orbitRef.current) orbitRef.current.enabled = !e.value
+    })
 
     let raf = 0
     const animate = () => {
       raf = requestAnimationFrame(animate)
+      orbit.update()
       renderer.render(scene, camera)
     }
     animate()
@@ -109,45 +136,56 @@ export default function App() {
     }
     window.addEventListener("resize", onResize)
 
-    // click select (raycaster)
+    // click select (raycaster) - ignore when dragging gizmo
     const raycaster = new THREE.Raycaster()
     const pointer = new THREE.Vector2()
 
     const onPointerDown = (e: PointerEvent) => {
+      if (draggingTransformRef.current) return
       const rect = renderer.domElement.getBoundingClientRect()
       pointer.x = ((e.clientX - rect.left) / rect.width) * 2 - 1
       pointer.y = -(((e.clientY - rect.top) / rect.height) * 2 - 1)
-
       raycaster.setFromCamera(pointer, camera)
       const meshes = Array.from(meshMapRef.current.values())
       const hits = raycaster.intersectObjects(meshes, false)
-
       if (hits.length > 0) {
         const mesh = hits[0].object as THREE.Mesh
         const id = (mesh.userData?.id as string) || ""
         if (id) setSelectedId(id)
       }
     }
-
     renderer.domElement.addEventListener("pointerdown", onPointerDown)
+
+    // keyboard: G = translate gizmo, Esc = detach
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "g" || e.key === "G") {
+        if (transformRef.current) transformRef.current.setMode("translate")
+      }
+      if (e.key === "Escape") {
+        transformRef.current?.detach()
+      }
+    }
+    window.addEventListener("keydown", onKeyDown)
 
     return () => {
       cancelAnimationFrame(raf)
       window.removeEventListener("resize", onResize)
+      window.removeEventListener("keydown", onKeyDown)
       renderer.domElement.removeEventListener("pointerdown", onPointerDown)
       renderer.dispose()
+      orbit.dispose()
+      transform.dispose()
       mount.removeChild(renderer.domElement)
     }
   }, [])
 
-  // sync meshes with parts
+  // create/update meshes from parts
   useEffect(() => {
     const scene = sceneRef.current
     if (!scene) return
 
     const meshMap = meshMapRef.current
 
-    // create/update
     for (const p of parts) {
       let mesh = meshMap.get(p.id)
       if (!mesh) {
@@ -159,17 +197,14 @@ export default function App() {
         meshMap.set(p.id, mesh)
       }
 
-      // transform
       mesh.position.set(p.position.x, p.position.y, p.position.z)
       mesh.scale.set(p.size.x, p.size.y, p.size.z)
 
-      // color
       const mat = mesh.material as THREE.MeshStandardMaterial
-      mat.color.setRGB(p.color.r, p.color.g, p.color.b)
+      mat.color.setRGB(clamp01(p.color.r), clamp01(p.color.g), clamp01(p.color.b))
       mat.needsUpdate = true
     }
 
-    // remove deleted
     for (const [id, mesh] of meshMap.entries()) {
       if (!parts.some((p) => p.id === id)) {
         scene.remove(mesh)
@@ -180,41 +215,64 @@ export default function App() {
     }
   }, [parts])
 
+  // attach gizmo to selected mesh
+  useEffect(() => {
+    const transform = transformRef.current
+    const mesh = meshMapRef.current.get(selectedId)
+    if (!transform) return
+    if (!mesh) {
+      transform.detach()
+      return
+    }
+    transform.attach(mesh)
+  }, [selectedId])
+
   // highlight selected
   useEffect(() => {
-    const meshMap = meshMapRef.current
-    for (const [id, mesh] of meshMap.entries()) {
+    for (const [id, mesh] of meshMapRef.current.entries()) {
       const mat = mesh.material as THREE.MeshStandardMaterial
       mat.emissive.setHex(id === selectedId ? 0x222222 : 0x000000)
     }
   }, [selectedId])
 
-  const num = (v: string) => {
-    const n = Number(v)
-    return Number.isFinite(n) ? n : 0
-  }
+  // when gizmo drag ends, write mesh position back to state
+  useEffect(() => {
+    const transform = transformRef.current
+    if (!transform) return
+
+    const onMouseUp = () => {
+      const mesh = meshMapRef.current.get(selectedId)
+      if (!mesh) return
+      // stateへ反映
+      setParts((prev) =>
+        prev.map((p) =>
+          p.id !== selectedId
+            ? p
+            : {
+                ...p,
+                position: { x: mesh.position.x, y: mesh.position.y, z: mesh.position.z },
+              }
+        )
+      )
+    }
+
+    transform.addEventListener("mouseUp", onMouseUp)
+    return () => {
+      transform.removeEventListener("mouseUp", onMouseUp)
+    }
+  }, [selectedId])
 
   return (
     <div style={{ height: "100vh", background: "#0b0f16", color: "#e7eefc" }}>
       {/* Topbar */}
-      <div
-        style={{
-          height: 48,
-          display: "flex",
-          alignItems: "center",
-          gap: 8,
-          padding: "0 12px",
-          borderBottom: "1px solid #23304a",
-        }}
-      >
+      <div style={topbar}>
         <b>Web Roblox Studio</b>
-        <button onClick={addPart} style={btn}>
-          + Part
-        </button>
+        <button onClick={addPart} style={btn}>+ Part</button>
+        <div style={{ opacity: 0.8, fontSize: 12 }}>操作: 右ドラッグ=視点 / スクロール=ズーム / G=移動</div>
       </div>
 
       {/* Layout */}
-      <div style={{ height: "calc(100vh - 48px)", display: "grid", gridTemplateColumns: "260px 1fr 320px" }}>
+      <div style={{ height: "calc(100vh - 48px)", display: "grid", gridTemplateColumns: "260px 1fr 360px" }}>
         {/* Explorer */}
         <div style={{ borderRight: "1px solid #23304a", padding: 10 }}>
           <b>Explorer</b>
@@ -252,7 +310,7 @@ export default function App() {
           />
         </div>
 
-        {/* Properties */}
+        {/* Properties + Script */}
         <div style={{ borderLeft: "1px solid #23304a", padding: 10 }}>
           <b>Properties</b>
 
@@ -262,11 +320,7 @@ export default function App() {
             <div style={{ marginTop: 10, display: "grid", gap: 10 }}>
               <label style={label}>
                 Name
-                <input
-                  style={input}
-                  value={selected.name}
-                  onChange={(e) => updateSelected({ name: e.target.value })}
-                />
+                <input style={input} value={selected.name} onChange={(e) => updateSelected({ name: e.target.value })} />
               </label>
 
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 }}>
@@ -276,9 +330,7 @@ export default function App() {
                     style={input}
                     type="number"
                     value={selected.position.x}
-                    onChange={(e) =>
-                      updateSelected({ position: { ...selected.position, x: num(e.target.value) } })
-                    }
+                    onChange={(e) => updateSelected({ position: { ...selected.position, x: num(e.target.value) } })}
                   />
                 </label>
                 <label style={label}>
@@ -287,9 +339,7 @@ export default function App() {
                     style={input}
                     type="number"
                     value={selected.position.y}
-                    onChange={(e) =>
-                      updateSelected({ position: { ...selected.position, y: num(e.target.value) } })
-                    }
+                    onChange={(e) => updateSelected({ position: { ...selected.position, y: num(e.target.value) } })}
                   />
                 </label>
                 <label style={label}>
@@ -298,9 +348,7 @@ export default function App() {
                     style={input}
                     type="number"
                     value={selected.position.z}
-                    onChange={(e) =>
-                      updateSelected({ position: { ...selected.position, z: num(e.target.value) } })
-                    }
+                    onChange={(e) => updateSelected({ position: { ...selected.position, z: num(e.target.value) } })}
                   />
                 </label>
               </div>
@@ -343,7 +391,7 @@ export default function App() {
                     type="number"
                     step="0.05"
                     value={selected.color.r}
-                    onChange={(e) => updateSelected({ color: { ...selected.color, r: num(e.target.value) } })}
+                    onChange={(e) => updateSelected({ color: { ...selected.color, r: clamp01(num(e.target.value)) } })}
                   />
                 </label>
                 <label style={label}>
@@ -353,7 +401,7 @@ export default function App() {
                     type="number"
                     step="0.05"
                     value={selected.color.g}
-                    onChange={(e) => updateSelected({ color: { ...selected.color, g: num(e.target.value) } })}
+                    onChange={(e) => updateSelected({ color: { ...selected.color, g: clamp01(num(e.target.value)) } })}
                   />
                 </label>
                 <label style={label}>
@@ -363,20 +411,33 @@ export default function App() {
                     type="number"
                     step="0.05"
                     value={selected.color.b}
-                    onChange={(e) => updateSelected({ color: { ...selected.color, b: num(e.target.value) } })}
+                    onChange={(e) => updateSelected({ color: { ...selected.color, b: clamp01(num(e.target.value)) } })}
                   />
                 </label>
               </div>
 
-              <div style={{ fontSize: 12, opacity: 0.8 }}>
-                ※Viewportのキューブをクリックして選択できる
-              </div>
+              <b style={{ marginTop: 6 }}>Script (Lua)</b>
+              <textarea
+                style={textarea}
+                value={selected.script}
+                onChange={(e) => updateSelected({ script: e.target.value })}
+                placeholder="ここにLuaを書く（今は保存だけ。次で実行エンジン）"
+              />
             </div>
           )}
         </div>
       </div>
     </div>
   )
+}
+
+const topbar: React.CSSProperties = {
+  height: 48,
+  display: "flex",
+  alignItems: "center",
+  gap: 10,
+  padding: "0 12px",
+  borderBottom: "1px solid #23304a",
 }
 
 const btn: React.CSSProperties = {
@@ -396,4 +457,15 @@ const input: React.CSSProperties = {
   border: "1px solid #23304a",
   background: "#0b0f16",
   color: "#e7eefc",
+}
+const textarea: React.CSSProperties = {
+  width: "100%",
+  height: 180,
+  padding: "10px 10px",
+  borderRadius: 10,
+  border: "1px solid #23304a",
+  background: "#0b0f16",
+  color: "#e7eefc",
+  resize: "vertical",
+  fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
 }
